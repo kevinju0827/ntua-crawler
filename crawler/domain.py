@@ -110,8 +110,12 @@ class DomainChecker:
         if domain in _rejected_domains:
             return False
 
-        # 未知域名：進行內容探測
-        return self._probe_domain(url, domain)
+        # # 未知域名：進行內容探測
+        # return self._probe_domain(url, domain)
+        # 未知域名：一律拒絕
+        logger.debug(f"[域名過濾] 拒絕非台藝大域名: {domain}")
+        _rejected_domains.add(domain)
+        return False
 
     def _probe_domain(self, url: str, domain: str) -> bool:
         """
