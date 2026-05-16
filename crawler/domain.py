@@ -10,7 +10,6 @@ crawler/domain.py — 智能域名檢查器
      → 達到門檻則加入白名單；否則標記為外部網站
 """
 import logging
-import re
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -36,7 +35,7 @@ def _extract_domain(url: str) -> Optional[str]:
 def _is_ntua_subdomain(domain: str) -> bool:
     """判斷是否為 ntua.edu.tw 或其子域名。"""
     return domain == config.BASE_NTUA_DOMAIN or \
-           domain.endswith("." + config.BASE_NTUA_DOMAIN)
+        domain.endswith("." + config.BASE_NTUA_DOMAIN)
 
 
 def _is_manual_allowed(domain: str) -> bool:

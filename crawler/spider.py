@@ -9,10 +9,10 @@ crawler/spider.py — 主要爬蟲協調器
   - 定期 checkpoint 輸出 CSV
 """
 import logging
+import re
 import signal
 import threading
 import time
-import re
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Optional
 from urllib.parse import urlparse
@@ -21,10 +21,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
-    MofNCompleteColumn,
     Progress,
     SpinnerColumn,
-    TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
 )
@@ -63,16 +61,16 @@ class Spider:
         config.PAGES_DIR.mkdir(parents=True, exist_ok=True)
         config.DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
-        self.state           = StateManager(config.STATE_DB)
-        self.session         = build_session()   # 調度執行緒用（域名探測）
-        self.fetcher         = Fetcher()         # 工作執行緒各自建 Session
-        self.domain_checker  = DomainChecker(self.state, self.session)
-        self.processor       = Processor(config.PAGES_DIR, config.DOCS_DIR)
+        self.state = StateManager(config.STATE_DB)
+        self.session = build_session()  # 調度執行緒用（域名探測）
+        self.fetcher = Fetcher()  # 工作執行緒各自建 Session
+        self.domain_checker = DomainChecker(self.state, self.session)
+        self.processor = Processor(config.PAGES_DIR, config.DOCS_DIR)
 
-        self._stop_flag      = threading.Event()
-        self._processed      = 0
+        self._stop_flag = threading.Event()
+        self._processed = 0
         self._processed_lock = threading.Lock()
-        self._start_time     = 0.0
+        self._start_time = 0.0
 
         signal.signal(signal.SIGINT, self._handle_interrupt)
 
@@ -207,7 +205,7 @@ class Spider:
         latest_url = ""  # 用來記錄當前派送的網址
 
         with progress, ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="crawler"
+                max_workers=workers, thread_name_prefix="crawler"
         ) as pool:
             while not self._stop_flag.is_set():
 
@@ -400,11 +398,11 @@ class Spider:
                     "webpage",
                 )
                 if self.state.add_url(
-                    norm,
-                    depth=depth + 1,
-                    parent_url=result.original_url,
-                    url_type=link_type,
-                    title=link_text if link_type != "webpage" else None,
+                        norm,
+                        depth=depth + 1,
+                        parent_url=result.original_url,
+                        url_type=link_type,
+                        title=link_text if link_type != "webpage" else None,
                 ):
                     added += 1
 

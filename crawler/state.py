@@ -6,48 +6,50 @@ crawler/state.py — SQLite 狀態管理器
 import sqlite3
 import threading
 from datetime import datetime
-from pathlib import Path
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 
 
 class UrlStatus(str, Enum):
-    PENDING    = "pending"
+    PENDING = "pending"
     PROCESSING = "processing"
-    DONE       = "done"
-    ERROR      = "error"
-    SKIPPED    = "skipped"
-    EXTERNAL   = "external"
+    DONE = "done"
+    ERROR = "error"
+    SKIPPED = "skipped"
+    EXTERNAL = "external"
 
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS urls (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    url           TEXT UNIQUE NOT NULL,
-    title         TEXT,
-    type          TEXT DEFAULT 'webpage',   -- webpage / pdf / docx / xlsx ...
-    content_type  TEXT,                     -- MIME type
-    status        TEXT DEFAULT 'pending',
-    depth         INTEGER DEFAULT 0,
-    file_size     INTEGER,
-    parent_url    TEXT,
-    local_path    TEXT,                     -- 本機儲存路徑
-    error_msg     TEXT,
-    discovered_at TEXT,
-    processed_at  TEXT,
-    retry_count   INTEGER DEFAULT 0
-);
+         CREATE TABLE IF NOT EXISTS urls
+         (
+             id            INTEGER PRIMARY KEY AUTOINCREMENT,
+             url           TEXT UNIQUE NOT NULL,
+             title         TEXT,
+             type          TEXT    DEFAULT 'webpage', -- webpage / pdf / docx / xlsx ...
+             content_type  TEXT,                      -- MIME type
+             status        TEXT    DEFAULT 'pending',
+             depth         INTEGER DEFAULT 0,
+             file_size     INTEGER,
+             parent_url    TEXT,
+             local_path    TEXT,                      -- 本機儲存路徑
+             error_msg     TEXT,
+             discovered_at TEXT,
+             processed_at  TEXT,
+             retry_count   INTEGER DEFAULT 0
+         );
 
-CREATE TABLE IF NOT EXISTS allowed_domains (
-    domain    TEXT PRIMARY KEY,
-    source    TEXT,        -- 'base' | 'manual' | 'auto-detected'
-    added_at  TEXT
-);
+         CREATE TABLE IF NOT EXISTS allowed_domains
+         (
+             domain   TEXT PRIMARY KEY,
+             source   TEXT, -- 'base' | 'manual' | 'auto-detected'
+             added_at TEXT
+         );
 
-CREATE INDEX IF NOT EXISTS idx_urls_status ON urls(status);
-CREATE INDEX IF NOT EXISTS idx_urls_depth  ON urls(depth, id);
-CREATE INDEX IF NOT EXISTS idx_urls_type   ON urls(type);
-"""
+         CREATE INDEX IF NOT EXISTS idx_urls_status ON urls (status);
+         CREATE INDEX IF NOT EXISTS idx_urls_depth ON urls (depth, id);
+         CREATE INDEX IF NOT EXISTS idx_urls_type ON urls (type); \
+         """
 
 
 class StateManager:
@@ -82,12 +84,12 @@ class StateManager:
     # ── URL 操作 ─────────────────────────────────────────────────────────────
 
     def add_url(
-        self,
-        url: str,
-        depth: int = 0,
-        parent_url: Optional[str] = None,
-        url_type: str = "webpage",
-        title: Optional[str] = None,
+            self,
+            url: str,
+            depth: int = 0,
+            parent_url: Optional[str] = None,
+            url_type: str = "webpage",
+            title: Optional[str] = None,
     ) -> bool:
         """
         新增 URL 至待爬佇列。
@@ -96,7 +98,7 @@ class StateManager:
         with self._lock, self._connect() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO urls
-                   (url, depth, parent_url, type, title, status, discovered_at)
+                       (url, depth, parent_url, type, title, status, discovered_at)
                    VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
                 (url, depth, parent_url, url_type, title, self._now()),
             )
@@ -124,18 +126,18 @@ class StateManager:
             return dict(row)
 
     def mark_done(
-        self,
-        url: str,
-        title: Optional[str] = None,
-        local_path: Optional[str] = None,
-        content_type: Optional[str] = None,
-        file_size: Optional[int] = None,
-        url_type: Optional[str] = None,
+            self,
+            url: str,
+            title: Optional[str] = None,
+            local_path: Optional[str] = None,
+            content_type: Optional[str] = None,
+            file_size: Optional[int] = None,
+            url_type: Optional[str] = None,
     ):
         with self._lock, self._connect() as conn:
             conn.execute(
-                """UPDATE urls SET
-                       status       = 'done',
+                """UPDATE urls
+                   SET status       = 'done',
                        title        = COALESCE(?, title),
                        local_path   = COALESCE(?, local_path),
                        content_type = COALESCE(?, content_type),
@@ -150,8 +152,8 @@ class StateManager:
     def mark_error(self, url: str, error_msg: str):
         with self._lock, self._connect() as conn:
             conn.execute(
-                """UPDATE urls SET
-                       status      = 'error',
+                """UPDATE urls
+                   SET status      = 'error',
                        error_msg   = ?,
                        retry_count = retry_count + 1,
                        processed_at= ?
@@ -162,8 +164,8 @@ class StateManager:
     def mark_skipped(self, url: str, reason: Optional[str] = None):
         with self._lock, self._connect() as conn:
             conn.execute(
-                """UPDATE urls SET
-                       status      = 'skipped',
+                """UPDATE urls
+                   SET status      = 'skipped',
                        error_msg   = ?,
                        processed_at= ?
                    WHERE url = ?""",

@@ -26,6 +26,7 @@ import config
 
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
@@ -34,13 +35,13 @@ logger = logging.getLogger(__name__)
 
 # ── 文件副檔名 → 類型標籤對應表 ──────────────────────────────────────────────
 EXT_TO_TYPE: dict[str, str] = {
-    ".pdf":  "pdf",
-    ".doc":  "doc",  ".docx": "docx",
-    ".xls":  "xls",  ".xlsx": "xlsx",
-    ".ppt":  "ppt",  ".pptx": "pptx",
-    ".odt":  "odt",  ".ods":  "ods",  ".odp": "odp",
-    ".zip":  "zip",  ".rar":  "rar",  ".7z":  "7z",
-    ".csv":  "csv",  ".txt":  "txt",
+    ".pdf": "pdf",
+    ".doc": "doc", ".docx": "docx",
+    ".xls": "xls", ".xlsx": "xlsx",
+    ".ppt": "ppt", ".pptx": "pptx",
+    ".odt": "odt", ".ods": "ods", ".odp": "odp",
+    ".zip": "zip", ".rar": "rar", ".7z": "7z",
+    ".csv": "csv", ".txt": "txt",
 }
 
 MIME_TO_TYPE: dict[str, str] = {
@@ -56,14 +57,14 @@ MIME_TO_TYPE: dict[str, str] = {
 
 @dataclass
 class FetchResult:
-    url: str           # 實際抓取的 URL（可能經重定向）
+    url: str  # 實際抓取的 URL（可能經重定向）
     original_url: str  # 原始請求 URL
     status_code: int
     content_type: str
     content: Optional[bytes]
     text: Optional[str]
     file_size: int
-    url_type: str      # 'webpage' / 'pdf' / 'docx' ...
+    url_type: str  # 'webpage' / 'pdf' / 'docx' ...
     error: Optional[str] = None
 
     @property
@@ -90,7 +91,7 @@ def build_session() -> requests.Session:
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry)
-    session.mount("http://",  adapter)
+    session.mount("http://", adapter)
     session.mount("https://", adapter)
     session.headers.update(config.HEADERS)
     session.verify = config.SSL_VERIFY
@@ -222,7 +223,7 @@ class Fetcher:
             # 大小限制
             content_length = int(resp.headers.get("Content-Length", 0))
             if content_length > max_bytes:
-                logger.warning(f"[跳過] 檔案過大 ({content_length/1024/1024:.1f} MB): {url}")
+                logger.warning(f"[跳過] 檔案過大 ({content_length / 1024 / 1024:.1f} MB): {url}")
                 return FetchResult(
                     url=resp.url, original_url=url,
                     status_code=resp.status_code,

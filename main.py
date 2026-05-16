@@ -12,7 +12,6 @@ main.py — 台藝大爬蟲 CLI 入口
 """
 import argparse
 import logging
-import sys
 
 
 # ── 設定 logging ──────────────────────────────────────────────────────────────

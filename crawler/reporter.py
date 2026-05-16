@@ -6,7 +6,6 @@ crawler/reporter.py — 報表產生器
 """
 import csv
 import logging
-from datetime import datetime
 from pathlib import Path
 
 from crawler.state import StateManager
@@ -15,12 +14,13 @@ logger = logging.getLogger(__name__)
 
 CSV_FIELDS = [
     "id",
-    "processed_at", # 處理完成時間
-    "status",       # 只會保留 done / skipped
-    "type",         # webpage / pdf / docx 等
-    "title",        # 頁面或文件標題
-    "url",          # 完整連結
+    "processed_at",  # 處理完成時間
+    "status",  # 只會保留 done / skipped
+    "type",  # webpage / pdf / docx 等
+    "title",  # 頁面或文件標題
+    "url",  # 完整連結
 ]
+
 
 def generate_csv(state: StateManager, output_path: Path) -> int:
     """
@@ -63,18 +63,18 @@ def print_summary(state: StateManager):
     table.add_column("百分比", justify="right")
 
     status_labels = {
-        "done":       "✅ 成功",
-        "error":      "❌ 錯誤",
-        "skipped":    "⏭  跳過",
-        "pending":    "⏳ 待處理",
+        "done": "✅ 成功",
+        "error": "❌ 錯誤",
+        "skipped": "⏭  跳過",
+        "pending": "⏳ 待處理",
         "processing": "🔄 處理中",
-        "external":   "🌐 外部",
+        "external": "🌐 外部",
     }
 
     for status, label in status_labels.items():
         count = stats.get(status, 0)
         if count:
-            pct = f"{count/total*100:.1f}%" if total else "-"
+            pct = f"{count / total * 100:.1f}%" if total else "-"
             table.add_row(label, str(count), pct)
 
     table.add_row("─" * 8, "─" * 6, "─" * 7)
