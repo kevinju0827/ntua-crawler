@@ -73,17 +73,25 @@ STATE_DB      = OUTPUT_DIR / "state.db" # SQLite 狀態資料庫
 CSV_OUTPUT    = OUTPUT_DIR / "inventory.csv"
 LOG_FILE      = OUTPUT_DIR / "crawler.log"
 
+# ── 並發設定 ──────────────────────────────────────────────────────────────────
+WORKERS             = 4          # 同時執行的爬取執行緒數量
+
 # ── 爬蟲行為設定 ──────────────────────────────────────────────────────────────
-MAX_DEPTH           = 8          # 最大爬取深度（0 = 只爬種子頁）
-MAX_PAGES           = 5000       # 最多處理頁面數（避免無限爬取）
-REQUEST_DELAY       = 0.8        # 每次請求間隔秒數（禮貌延遲）
+MAX_DEPTH           = 999        # 最大爬取深度（預設近乎無限，僅由 MAX_PAGES 兜底）
+MAX_PAGES           = 500_000    # 最多處理頁面數（防止磁碟爆滿的最終保護）
+REQUEST_DELAY       = 0.8        # 每個執行緒各自的請求間隔秒數（禮貌延遲）
 REQUEST_TIMEOUT     = 30         # 單一請求超時秒數
 MAX_RETRIES         = 2          # 失敗重試次數
-MAX_PAGE_SIZE_MB    = 20         # 單頁最大下載大小（MB）
+MAX_PAGE_SIZE_MB    = 512        # 單頁最大下載大小（MB，涵蓋絕大多數網頁與文件）
 
 # 下載文件並轉換為 Markdown（True=下載並轉換, False=只記錄於 CSV）
 DOWNLOAD_DOCUMENTS  = True
-MAX_DOC_SIZE_MB     = 50         # 文件最大下載大小（MB）
+MAX_DOC_SIZE_MB     = 512        # 文件最大下載大小（MB，與頁面共用上限）
+
+# ── SSL 設定 ──────────────────────────────────────────────────────────────────
+# 設為 True 時忽略 SSL 憑證錯誤（允許連線至憑證過期/自簽名的系所網站）
+# 警告：此選項會降低安全性，僅建議在受信任的學術網路環境中使用
+SSL_VERIFY          = True
 
 # ── HTTP 設定 ─────────────────────────────────────────────────────────────────
 USER_AGENT = (

@@ -1,21 +1,21 @@
 """
-crawler/spider.py — 主要爬蟲協調器
+crawler/spider.py — 主要爬蟲協調器（多執行緒版）
 職責：
   - 初始化各元件（State、Fetcher、DomainChecker、Processor）
-  - 主爬取迴圈（支援 Ctrl+C 優雅停止）
-  - 決策：每個 URL 要做什麼（爬取網頁 / 下載文件 / 跳過）
-  - 定期輸出進度與統計資訊
+  - 以 ThreadPoolExecutor 並發爬取（預設 4 執行緒）
+  - BFS 廣度優先：主執行緒持續從 DB 取出 pending URL 派送給工作執行緒
+  - 支援 Ctrl+C 優雅停止（完成已派送的任務後停止）
+  - 定期 checkpoint 輸出 CSV
 """
 import logging
 import signal
-import sys
+import threading
 import time
-from pathlib import Path
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Optional
 from urllib.parse import urlparse
 
 from rich.console import Console
-from rich.live import Live
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
@@ -26,14 +26,13 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
 )
-from rich.text import Text
 
 import config
 from crawler.domain import DomainChecker
 from crawler.fetcher import Fetcher, build_session, normalize_url
 from crawler.processor import Processor
 from crawler.reporter import generate_csv, print_summary
-from crawler.state import StateManager, UrlStatus
+from crawler.state import StateManager
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -41,45 +40,54 @@ console = Console()
 
 class Spider:
     """
-    台藝大網站爬蟲。
-    使用 BFS（廣度優先）策略，優先爬取淺層頁面。
+    台藝大網站多執行緒爬蟲。
+
+    架構：
+      - 1 個主執行緒負責調度（從 DB 取 URL、判斷域名、派送任務）
+      - N 個工作執行緒（config.WORKERS）負責 HTTP 抓取 + 內容處理
+      - 每個工作執行緒有獨立的 requests.Session 與速率計時器
+      - DomainChecker 帶鎖共享（域名探測為 I/O 密集，可並發）
+      - StateManager 以 SQLite WAL 模式支援多執行緒並發寫入
 
     執行方式：
         spider = Spider()
-        spider.run()          # 從頭開始或繼續上次進度
+        spider.run()           # 繼續上次進度（或從頭開始）
         spider.run(fresh=True) # 強制清空重新爬
     """
 
     def __init__(self):
-        # 確保輸出目錄存在
         config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         config.PAGES_DIR.mkdir(parents=True, exist_ok=True)
         config.DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
-        self.state     = StateManager(config.STATE_DB)
-        self.session   = build_session()
-        self.fetcher   = Fetcher(self.session)
-        self.domain_checker = DomainChecker(self.state, self.session)
-        self.processor = Processor(config.PAGES_DIR, config.DOCS_DIR)
+        self.state           = StateManager(config.STATE_DB)
+        self.session         = build_session()   # 調度執行緒用（域名探測）
+        self.fetcher         = Fetcher()         # 工作執行緒各自建 Session
+        self.domain_checker  = DomainChecker(self.state, self.session)
+        self.processor       = Processor(config.PAGES_DIR, config.DOCS_DIR)
 
-        self._stop_flag = False
-        self._processed = 0
-        self._start_time = 0.0
+        self._stop_flag      = threading.Event()
+        self._processed      = 0
+        self._processed_lock = threading.Lock()
+        self._start_time     = 0.0
 
-        # 優雅停止：捕捉 SIGINT (Ctrl+C)
         signal.signal(signal.SIGINT, self._handle_interrupt)
 
     # ── 啟動與控制 ────────────────────────────────────────────────────────────
 
     def _handle_interrupt(self, signum, frame):
-        console.print("\n[yellow]⚠️  收到中斷信號，完成目前項目後停止…[/yellow]")
-        self._stop_flag = True
+        if not self._stop_flag.is_set():
+            console.print(
+                "\n[yellow]⚠️  收到中斷信號，等待目前工作執行緒完成後停止…[/yellow]"
+                "\n[dim]（再次按 Ctrl+C 強制終止）[/dim]"
+            )
+            self._stop_flag.set()
+        else:
+            console.print("\n[red]強制終止[/red]")
+            raise KeyboardInterrupt
 
     def run(self, fresh: bool = False):
-        """
-        主入口。
-        fresh=True 時清空 DB 並重新開始；否則繼續上次進度。
-        """
+        """主入口。fresh=True 時清空 DB 重新開始。"""
         if fresh:
             if config.STATE_DB.exists():
                 config.STATE_DB.unlink()
@@ -87,10 +95,8 @@ class Spider:
             self.state = StateManager(config.STATE_DB)
             self.domain_checker = DomainChecker(self.state, self.session)
 
-        # 重置殘留的 processing 狀態（上次異常中斷遺留）
         self.state.reset_stale_processing()
 
-        # 種子 URL
         for url in config.SEED_URLS:
             norm = normalize_url(url)
             if self.state.add_url(norm, depth=0):
@@ -103,21 +109,24 @@ class Spider:
             generate_csv(self.state, config.CSV_OUTPUT)
             return
 
+        workers = config.WORKERS
         console.print(
             Panel(
                 f"[bold cyan]台藝大爬蟲啟動[/bold cyan]\n"
-                f"待處理 URL: [yellow]{pending}[/yellow]\n"
-                f"輸出目錄: [green]{config.OUTPUT_DIR.resolve()}[/green]\n"
-                f"最大深度: {config.MAX_DEPTH}  /  最大頁面數: {config.MAX_PAGES}",
+                f"待處理 URL : [yellow]{pending}[/yellow]\n"
+                f"並發執行緒 : [magenta]{workers}[/magenta]\n"
+                f"輸出目錄   : [green]{config.OUTPUT_DIR.resolve()}[/green]\n"
+                f"最大深度   : {config.MAX_DEPTH}  /  最大頁面數 : {config.MAX_PAGES}\n"
+                f"SSL 驗證   : {'[green]開啟[/green]' if config.SSL_VERIFY else '[red]關閉（允許不安全連線）[/red]'}\n"
+                f"單檔上限   : {config.MAX_PAGE_SIZE_MB} MB",
                 title="🕷️  NTUA Crawler",
                 border_style="blue",
             )
         )
 
         self._start_time = time.monotonic()
-        self._crawl_loop()
+        self._crawl_loop(workers)
 
-        # 完成後輸出報表
         print_summary(self.state)
         count = generate_csv(self.state, config.CSV_OUTPUT)
         console.print(
@@ -125,10 +134,17 @@ class Spider:
             f"[dim]({count} 筆)[/dim]"
         )
 
-    # ── 主迴圈 ────────────────────────────────────────────────────────────────
+    # ── 並發主迴圈 ────────────────────────────────────────────────────────────
 
-    def _crawl_loop(self):
-        """BFS 主迴圈。"""
+    def _crawl_loop(self, workers: int):
+        """
+        調度迴圈：主執行緒持續取 URL 並派送至執行緒池。
+
+        滑動視窗策略：
+          - 在途任務上限 = workers × 4（確保執行緒池常滿，不因調度延遲空轉）
+          - 主執行緒輪詢間隔 50ms，幾乎無 CPU 開銷
+          - 每 50 筆完成觸發 CSV checkpoint
+        """
         progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -139,72 +155,133 @@ class Spider:
             console=console,
             transient=False,
         )
-        task = progress.add_task("爬取中…", total=config.MAX_PAGES)
+        task_id = progress.add_task("爬取中…", total=config.MAX_PAGES)
 
-        with progress:
-            while not self._stop_flag:
-                if self._processed >= config.MAX_PAGES:
+        in_flight: set[Future] = set()
+        max_in_flight = workers * 4
+        last_checkpoint = 0
+
+        with progress, ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="crawler"
+        ) as pool:
+            while not self._stop_flag.is_set():
+
+                # ── 收割已完成的 futures ──────────────────────────────────
+                done_futures = {f for f in in_flight if f.done()}
+                for f in done_futures:
+                    in_flight.discard(f)
+                    try:
+                        f.result()
+                    except Exception as e:
+                        logger.error(f"[工作執行緒例外] {e}", exc_info=True)
+                    with self._processed_lock:
+                        self._processed += 1
+                    progress.update(task_id, completed=self._processed)
+
+                # ── 檢查頁面上限 ──────────────────────────────────────────
+                with self._processed_lock:
+                    current = self._processed
+                if current >= config.MAX_PAGES:
                     console.print(
-                        f"[yellow]⚠️  已達最大頁面數限制 ({config.MAX_PAGES})，停止爬取[/yellow]"
+                        f"[yellow]⚠️  已達最大頁面數限制 ({config.MAX_PAGES})，"
+                        f"等待 {len(in_flight)} 個任務完成後停止[/yellow]"
                     )
+                    self._stop_flag.set()
                     break
 
-                item = self.state.get_next_pending()
-                if item is None:
+                # ── 補充新任務（填滿在途視窗）────────────────────────────
+                slots = max_in_flight - len(in_flight)
+                dispatched = 0
+                while dispatched < slots and not self._stop_flag.is_set():
+                    item = self.state.get_next_pending()
+                    if item is None:
+                        break
+
+                    url   = item["url"]
+                    depth = item["depth"]
+
+                    # 超過深度限制：主執行緒直接跳過，不佔工作執行緒資源
+                    if depth > config.MAX_DEPTH:
+                        self.state.mark_skipped(
+                            url, f"超過最大深度 ({depth} > {config.MAX_DEPTH})"
+                        )
+                        with self._processed_lock:
+                            self._processed += 1
+                        continue
+
+                    progress.update(
+                        task_id,
+                        description=(
+                            f"[cyan]{url[:72]}…" if len(url) > 72 else f"[cyan]{url}"
+                        ),
+                    )
+
+                    future = pool.submit(
+                        self._process_url, url, depth, item.get("parent_url")
+                    )
+                    in_flight.add(future)
+                    dispatched += 1
+
+                # ── 結束條件：佇列空 + 沒有在途任務 ─────────────────────
+                if not in_flight and self.state.get_pending_count() == 0:
                     console.print("[green]✅ 所有 URL 已處理完畢[/green]")
                     break
 
-                url   = item["url"]
-                depth = item["depth"]
+                # ── Checkpoint（每 50 筆） ────────────────────────────────
+                with self._processed_lock:
+                    current = self._processed
+                if current - last_checkpoint >= 50 and current > 0:
+                    last_checkpoint = current
+                    self._checkpoint(current)
 
-                # 超過最大深度
-                if depth > config.MAX_DEPTH:
-                    self.state.mark_skipped(url, f"超過最大深度 ({depth} > {config.MAX_DEPTH})")
-                    continue
+                # 主執行緒短暫讓出，避免 CPU 空轉
+                time.sleep(0.05)
 
-                progress.update(
-                    task,
-                    description=f"[cyan]{url[:70]}…" if len(url) > 70 else f"[cyan]{url}",
-                    advance=1,
-                    completed=self._processed,
+            # ── 停止後收割剩餘在途任務 ───────────────────────────────────
+            if in_flight:
+                console.print(
+                    f"[dim]等待 {len(in_flight)} 個進行中任務完成…[/dim]"
                 )
+                for f in as_completed(in_flight):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        logger.error(f"[工作執行緒例外] {e}")
+                    with self._processed_lock:
+                        self._processed += 1
+                    progress.update(task_id, completed=self._processed)
 
-                self._process_url(url, depth, item.get("parent_url"))
-                self._processed += 1
+    def _checkpoint(self, processed: int):
+        generate_csv(self.state, config.CSV_OUTPUT)
+        elapsed = time.monotonic() - self._start_time
+        rate = processed / elapsed if elapsed > 0 else 0
+        stats = self.state.get_stats()
+        logger.info(
+            f"[Checkpoint] 已處理 {processed} 筆 | "
+            f"速率 {rate:.1f} 頁/秒 | {stats}"
+        )
 
-                # 每 50 筆自動存一次 CSV（checkpoint）
-                if self._processed % 50 == 0:
-                    generate_csv(self.state, config.CSV_OUTPUT)
-                    stats = self.state.get_stats()
-                    elapsed = time.monotonic() - self._start_time
-                    rate = self._processed / elapsed if elapsed > 0 else 0
-                    logger.info(
-                        f"[進度] 已處理 {self._processed} 筆 "
-                        f"| 速率 {rate:.1f} 頁/秒 "
-                        f"| 統計 {stats}"
-                    )
-
-    # ── 單一 URL 處理 ─────────────────────────────────────────────────────────
+    # ── 單一 URL 處理（工作執行緒中執行）────────────────────────────────────
 
     def _process_url(self, url: str, depth: int, parent_url: Optional[str]):
-        """處理單一 URL 的完整流程。"""
+        """工作執行緒執行的完整處理流程。所有呼叫的方法均為執行緒安全。"""
 
-        # 1. 跳過條件檢查（協定、副檔名等）
+        # 1. 跳過條件（協定、副檔名等）
         skip_reason = self.domain_checker.should_skip_url(url)
         if skip_reason:
             self.state.mark_skipped(url, skip_reason)
             return
 
-        # 2. 域名白名單檢查
+        # 2. 域名白名單（含自動探測；DomainChecker 內部有鎖）
         if not self.domain_checker.is_allowed(url):
             self.state.mark_skipped(url, "外部網站")
             return
 
-        # 3. 判斷是否為文件（根據副檔名）
+        # 3. 判斷是否為文件副檔名
         path_lower = urlparse(url).path.lower()
         is_document = any(path_lower.endswith(ext) for ext in config.DOCUMENT_EXTENSIONS)
 
-        # 4. 抓取
+        # 4. 抓取（每執行緒獨立 Session，速率計時器互不干擾）
         logger.debug(f"[抓取] {url}")
         result = self.fetcher.fetch(url, is_document=is_document)
 
@@ -212,19 +289,21 @@ class Spider:
             self.state.mark_error(url, result.error or f"HTTP {result.status_code}")
             return
 
-        # 5. 以最終 URL（重定向後）正規化
+        # 5. 處理重定向後的最終 URL
         final_url = normalize_url(result.url)
         if final_url != url and not self.state.is_known_url(final_url):
-            self.state.add_url(final_url, depth=depth, parent_url=parent_url,
-                               url_type=result.url_type)
+            self.state.add_url(
+                final_url, depth=depth, parent_url=parent_url,
+                url_type=result.url_type,
+            )
 
-        # 6. 依類型處理
+        # 6. 依類型分流
+        doc_type_set = {e.lstrip(".") for e in config.DOCUMENT_EXTENSIONS}
         if result.url_type == "webpage":
             self._handle_webpage(result, depth)
-        elif result.url_type in config.DOCUMENT_EXTENSIONS or is_document:
-            self._handle_document(result, parent_url)
+        elif is_document or result.url_type in doc_type_set:
+            self._handle_document(result)
         else:
-            # 其他類型：僅記錄
             self.state.mark_done(
                 url,
                 content_type=result.content_type,
@@ -233,10 +312,8 @@ class Spider:
             )
 
     def _handle_webpage(self, result, depth: int):
-        """處理 HTML 網頁：轉 Markdown + 提取連結。"""
         try:
             title, local_path, links = self.processor.process_webpage(result)
-
             self.state.mark_done(
                 result.original_url,
                 title=title,
@@ -246,23 +323,16 @@ class Spider:
                 url_type="webpage",
             )
 
-            # 將新發現的連結加入佇列
             added = 0
             for link_url, link_text in links:
                 norm = normalize_url(link_url, result.url)
                 if not norm:
                     continue
-
-                # 判斷類型
-                path_lower = urlparse(norm).path.lower()
-                link_type = "webpage"
-                for ext, t in {
-                    **{e: e.lstrip(".") for e in config.DOCUMENT_EXTENSIONS}
-                }.items():
-                    if path_lower.endswith(ext):
-                        link_type = t
-                        break
-
+                lp = urlparse(norm).path.lower()
+                link_type = next(
+                    (e.lstrip(".") for e in config.DOCUMENT_EXTENSIONS if lp.endswith(e)),
+                    "webpage",
+                )
                 if self.state.add_url(
                     norm,
                     depth=depth + 1,
@@ -278,12 +348,9 @@ class Spider:
             logger.exception(f"[錯誤] 處理網頁失敗: {result.url}")
             self.state.mark_error(result.original_url, str(e))
 
-    def _handle_document(self, result, parent_url: Optional[str]):
-        """處理文件：轉 Markdown + 記錄。"""
+    def _handle_document(self, result):
         try:
-            # 取得連結文字（從 parent_url 頁面中查詢，簡化為用 URL）
             title, local_path = self.processor.process_document(result)
-
             self.state.mark_done(
                 result.original_url,
                 title=title,

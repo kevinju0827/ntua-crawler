@@ -3,18 +3,22 @@ crawler/fetcher.py — HTTP 抓取器
 功能：
   - requests.Session 複用（Keep-Alive、Cookie 持久）
   - 自動重試（指數退避）
-  - 速率限制（禮貌延遲）
+  - 每執行緒獨立速率限制（並發時各自計時，互不干擾）
   - 大型回應保護（超過設定大小則拒絕）
   - MIME 類型解析（判斷是網頁還是文件）
+  - SSL 憑證驗證開關（支援憑證過期的系所網站）
 """
 import logging
+import threading
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import chardet
 import requests
+import urllib3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -62,7 +66,15 @@ class FetchResult:
 
 
 def build_session() -> requests.Session:
-    """建立配有重試策略的 Session。"""
+    """
+    建立配有重試策略的 Session。
+    若 config.SSL_VERIFY = False，則停用 SSL 驗證並壓制 InsecureRequestWarning。
+    """
+    if not config.SSL_VERIFY:
+        # 全域壓制不安全連線警告（避免每次請求都印出警告洗版）
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+
     session = requests.Session()
     retry = Retry(
         total=config.MAX_RETRIES,
@@ -75,6 +87,7 @@ def build_session() -> requests.Session:
     session.mount("http://",  adapter)
     session.mount("https://", adapter)
     session.headers.update(config.HEADERS)
+    session.verify = config.SSL_VERIFY
     return session
 
 
@@ -137,22 +150,44 @@ def _decode_text(content: bytes, content_type: str) -> str:
     return content.decode("utf-8", errors="replace")
 
 
+# 每個執行緒獨立維護自己的最後請求時間（threading.local）
+_thread_local = threading.local()
+
+
 class Fetcher:
     """
     帶速率限制的 HTTP 抓取器。
-    使用 `_last_request_time` 控制每次請求之間的最小間隔。
+    多執行緒安全：每個執行緒有獨立的 Session 與速率計時器，
+    彼此的延遲互不干擾，可真正並發發出請求。
     """
 
     def __init__(self, session: Optional[requests.Session] = None):
-        self.session = session or build_session()
-        self._last_request_time: float = 0.0
+        # session 參數為向下相容保留，多執行緒模式下每個執行緒自建 Session
+        self._shared_session = session
+        self._lock = threading.Lock()
+
+    def _get_session(self) -> requests.Session:
+        """
+        取得當前執行緒專屬的 Session（懶建立）。
+        使用「執行緒 id + Fetcher 物件 id」作為 key，
+        確保即使 OS 執行緒被快速回收再建立時，
+        新執行緒不會誤用舊 Session。
+        """
+        key = f"session_{id(self)}"
+        if not hasattr(_thread_local, key):
+            setattr(_thread_local, key, build_session())
+        return getattr(_thread_local, key)
 
     def _rate_limit(self):
-        """確保距離上次請求至少間隔 REQUEST_DELAY 秒。"""
-        elapsed = time.monotonic() - self._last_request_time
+        """
+        確保「同一執行緒」距離上次請求至少間隔 REQUEST_DELAY 秒。
+        不同執行緒使用各自的計時器，互不阻塞。
+        """
+        last = getattr(_thread_local, "last_request_time", 0.0)
+        elapsed = time.monotonic() - last
         if elapsed < config.REQUEST_DELAY:
             time.sleep(config.REQUEST_DELAY - elapsed)
-        self._last_request_time = time.monotonic()
+        _thread_local.last_request_time = time.monotonic()
 
     def fetch(self, url: str, is_document: bool = False) -> FetchResult:
         """
@@ -160,6 +195,7 @@ class Fetcher:
         is_document=True 時會下載完整 bytes（用於文件轉換）。
         """
         self._rate_limit()
+        session = self._get_session()
         max_bytes = (
             config.MAX_DOC_SIZE_MB * 1024 * 1024 if is_document
             else config.MAX_PAGE_SIZE_MB * 1024 * 1024
@@ -167,7 +203,7 @@ class Fetcher:
 
         type_hint = _detect_type_from_url(url)
         try:
-            resp = self.session.get(
+            resp = session.get(
                 url,
                 timeout=config.REQUEST_TIMEOUT,
                 allow_redirects=True,
@@ -239,8 +275,9 @@ class Fetcher:
         """快速檢查 URL 是否可達（不下載 body）。"""
         self._rate_limit()
         try:
-            return self.session.head(
-                url, timeout=10, allow_redirects=True
+            return self._get_session().head(
+                url, timeout=10, allow_redirects=True,
+                verify=config.SSL_VERIFY,
             )
         except Exception:
             return None
