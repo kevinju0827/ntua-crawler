@@ -112,31 +112,68 @@ def derive_document_title(url: str, link_text: Optional[str] = None) -> str:
 def extract_links(soup: BeautifulSoup, base_url: str) -> list[tuple[str, str]]:
     """
     從 BeautifulSoup 物件中提取所有連結。
+    支援標準 HTML、Vue/Nuxt 路由標籤、自定義 data 屬性以及腳本內的狀態資料。
     回傳 [(url, link_text), ...]。
     """
     links = []
     seen = set()
 
-    for tag in soup.find_all(["a", "area"], href=True):
-        href = tag.get("href", "").strip()
-        if not href or href.startswith(("javascript:", "mailto:", "tel:")):
-            continue
-        full_url = urljoin(base_url, href)
-        # 移除 fragment
-        full_url = full_url.split("#")[0]
+    def add_link(url_candidate: str, text: str = ""):
+        """輔助函式：清理網址並過濾重複項目"""
+        if not url_candidate or not isinstance(url_candidate, str):
+            return
+        url_candidate = url_candidate.strip()
+
+        # 過濾空值與非導航用途的協定
+        if not url_candidate or url_candidate.startswith(("javascript:", "mailto:", "tel:", "data:")):
+            return
+
+        # 組合成絕對路徑並移除 fragment (錨點)
+        full_url = urljoin(base_url, url_candidate).split("#")[0]
         if full_url and full_url not in seen:
             seen.add(full_url)
-            link_text = tag.get_text(strip=True)
-            links.append((full_url, link_text))
+            # 限制連結文字長度，避免抓到整段文章
+            clean_text = text.strip()[:100]
+            links.append((full_url, clean_text))
 
-    # frame / iframe src
+    # 1. 掃描標準與非標準的導航標籤
+    target_tags = soup.find_all(["a", "area", "router-link", "nuxt-link", "div", "button", "li", "span"])
+
+    for tag in target_tags:
+        # 尋找各種可能儲存 URL 的屬性
+        href = (
+                tag.get("href") or
+                tag.get("to") or  # Vue / Nuxt 路由
+                tag.get("data-href") or  # 自定義屬性
+                tag.get("data-url") or
+                tag.get("data-link")
+        )
+        if href:
+            add_link(href, tag.get_text(strip=True))
+
+    # 2. Frame 與 Iframe 資源
     for tag in soup.find_all(["frame", "iframe"], src=True):
-        src = tag.get("src", "").strip()
-        if src.startswith(("http://", "https://", "/")):
-            full_url = urljoin(base_url, src).split("#")[0]
-            if full_url not in seen:
-                seen.add(full_url)
-                links.append((full_url, ""))
+        src = tag.get("src")
+        if src and src.strip().startswith(("http://", "https://", "/")):
+            add_link(src, f"iframe (title: {tag.get('title', 'N/A')})")
+
+    # 3. Meta 標籤 (例如 Canonical Links 或 Open Graph URL)
+    for tag in soup.find_all("meta"):
+        prop = tag.get("property", "").lower()
+        name = tag.get("name", "").lower()
+        if "url" in prop or "url" in name:
+            content = tag.get("content")
+            if content:
+                add_link(content, f"meta ({prop or name})")
+
+    # 4. 從 <script> 中挖出隱藏在 JSON 狀態中的連結
+    for script in soup.find_all("script"):
+        if script.string:
+            # 尋找鍵值為 href, url, to 後面的字串
+            matches = re.findall(r'(?:href|url|to)["\']?\s*:\s*["\']([^"\']+)["\']', script.string, re.IGNORECASE)
+            for match in matches:
+                if len(match) > 1 and not match.startswith(("{", "[")):
+                    add_link(match, "script-data")
 
     return links
 
