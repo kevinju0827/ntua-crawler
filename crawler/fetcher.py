@@ -1,0 +1,246 @@
+"""
+crawler/fetcher.py — HTTP 抓取器
+功能：
+  - requests.Session 複用（Keep-Alive、Cookie 持久）
+  - 自動重試（指數退避）
+  - 速率限制（禮貌延遲）
+  - 大型回應保護（超過設定大小則拒絕）
+  - MIME 類型解析（判斷是網頁還是文件）
+"""
+import logging
+import time
+from dataclasses import dataclass
+from typing import Optional
+from urllib.parse import urljoin, urlparse, urlunparse
+
+import chardet
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+import config
+
+logger = logging.getLogger(__name__)
+
+# ── 文件副檔名 → 類型標籤對應表 ──────────────────────────────────────────────
+EXT_TO_TYPE: dict[str, str] = {
+    ".pdf":  "pdf",
+    ".doc":  "doc",  ".docx": "docx",
+    ".xls":  "xls",  ".xlsx": "xlsx",
+    ".ppt":  "ppt",  ".pptx": "pptx",
+    ".odt":  "odt",  ".ods":  "ods",  ".odp": "odp",
+    ".zip":  "zip",  ".rar":  "rar",  ".7z":  "7z",
+    ".csv":  "csv",  ".txt":  "txt",
+}
+
+MIME_TO_TYPE: dict[str, str] = {
+    "application/pdf": "pdf",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.ms-powerpoint": "ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+}
+
+
+@dataclass
+class FetchResult:
+    url: str           # 實際抓取的 URL（可能經重定向）
+    original_url: str  # 原始請求 URL
+    status_code: int
+    content_type: str
+    content: Optional[bytes]
+    text: Optional[str]
+    file_size: int
+    url_type: str      # 'webpage' / 'pdf' / 'docx' ...
+    error: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and 200 <= self.status_code < 400
+
+
+def build_session() -> requests.Session:
+    """建立配有重試策略的 Session。"""
+    session = requests.Session()
+    retry = Retry(
+        total=config.MAX_RETRIES,
+        backoff_factor=1.0,
+        status_forcelist={429, 500, 502, 503, 504},
+        allowed_methods={"GET", "HEAD"},
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://",  adapter)
+    session.mount("https://", adapter)
+    session.headers.update(config.HEADERS)
+    return session
+
+
+def normalize_url(url: str, base: Optional[str] = None) -> str:
+    """
+    正規化 URL：
+      - 補全相對路徑（base 不為 None 時）
+      - 移除錨點（#fragment）
+      - 統一 scheme 為小寫
+    """
+    if base:
+        url = urljoin(base, url)
+    parsed = urlparse(url)
+    # 移除 fragment
+    clean = parsed._replace(fragment="")
+    return urlunparse(clean)
+
+
+def _detect_type_from_url(url: str) -> Optional[str]:
+    path = urlparse(url).path.lower()
+    for ext, t in EXT_TO_TYPE.items():
+        if path.endswith(ext):
+            return t
+    return None
+
+
+def _detect_type_from_mime(content_type: str) -> str:
+    mime = content_type.split(";")[0].strip().lower()
+    if mime in MIME_TO_TYPE:
+        return MIME_TO_TYPE[mime]
+    if "html" in mime or "xhtml" in mime:
+        return "webpage"
+    return "other"
+
+
+def _decode_text(content: bytes, content_type: str) -> str:
+    """嘗試多種編碼解碼 bytes→str，優先依 Content-Type 指定。"""
+    # 從 Content-Type 取 charset
+    charset = None
+    for part in content_type.split(";"):
+        part = part.strip()
+        if part.lower().startswith("charset="):
+            charset = part.split("=", 1)[1].strip().strip('"').strip("'")
+            break
+
+    # 嘗試順序：宣告編碼 → chardet 自動偵測 → utf-8 → big5
+    candidates = []
+    if charset:
+        candidates.append(charset)
+    detected = chardet.detect(content[:8192])
+    if detected.get("encoding"):
+        candidates.append(detected["encoding"])
+    candidates += ["utf-8", "big5", "gb2312", "latin-1"]
+
+    for enc in candidates:
+        try:
+            return content.decode(enc, errors="strict")
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return content.decode("utf-8", errors="replace")
+
+
+class Fetcher:
+    """
+    帶速率限制的 HTTP 抓取器。
+    使用 `_last_request_time` 控制每次請求之間的最小間隔。
+    """
+
+    def __init__(self, session: Optional[requests.Session] = None):
+        self.session = session or build_session()
+        self._last_request_time: float = 0.0
+
+    def _rate_limit(self):
+        """確保距離上次請求至少間隔 REQUEST_DELAY 秒。"""
+        elapsed = time.monotonic() - self._last_request_time
+        if elapsed < config.REQUEST_DELAY:
+            time.sleep(config.REQUEST_DELAY - elapsed)
+        self._last_request_time = time.monotonic()
+
+    def fetch(self, url: str, is_document: bool = False) -> FetchResult:
+        """
+        抓取單一 URL 並回傳 FetchResult。
+        is_document=True 時會下載完整 bytes（用於文件轉換）。
+        """
+        self._rate_limit()
+        max_bytes = (
+            config.MAX_DOC_SIZE_MB * 1024 * 1024 if is_document
+            else config.MAX_PAGE_SIZE_MB * 1024 * 1024
+        )
+
+        type_hint = _detect_type_from_url(url)
+        try:
+            resp = self.session.get(
+                url,
+                timeout=config.REQUEST_TIMEOUT,
+                allow_redirects=True,
+                stream=True,
+            )
+
+            content_type = resp.headers.get("Content-Type", "")
+            url_type = type_hint or _detect_type_from_mime(content_type)
+
+            # 大小限制
+            content_length = int(resp.headers.get("Content-Length", 0))
+            if content_length > max_bytes:
+                logger.warning(f"[跳過] 檔案過大 ({content_length/1024/1024:.1f} MB): {url}")
+                return FetchResult(
+                    url=resp.url, original_url=url,
+                    status_code=resp.status_code,
+                    content_type=content_type,
+                    content=None, text=None, file_size=content_length,
+                    url_type=url_type,
+                    error=f"檔案過大 ({content_length} bytes)",
+                )
+
+            # 流式讀取（帶大小上限）
+            chunks = []
+            total = 0
+            for chunk in resp.iter_content(chunk_size=65536):
+                total += len(chunk)
+                if total > max_bytes:
+                    logger.warning(f"[截斷] 超過大小限制: {url}")
+                    break
+                chunks.append(chunk)
+            content = b"".join(chunks)
+            file_size = len(content)
+
+            text = None
+            if url_type == "webpage":
+                text = _decode_text(content, content_type)
+
+            return FetchResult(
+                url=resp.url, original_url=url,
+                status_code=resp.status_code,
+                content_type=content_type,
+                content=content,
+                text=text,
+                file_size=file_size,
+                url_type=url_type,
+            )
+
+        except requests.exceptions.Timeout:
+            return FetchResult(
+                url=url, original_url=url, status_code=0,
+                content_type="", content=None, text=None, file_size=0,
+                url_type=type_hint or "webpage", error="請求超時",
+            )
+        except requests.exceptions.ConnectionError as e:
+            return FetchResult(
+                url=url, original_url=url, status_code=0,
+                content_type="", content=None, text=None, file_size=0,
+                url_type=type_hint or "webpage", error=f"連線失敗: {e}",
+            )
+        except Exception as e:
+            return FetchResult(
+                url=url, original_url=url, status_code=0,
+                content_type="", content=None, text=None, file_size=0,
+                url_type=type_hint or "webpage", error=str(e),
+            )
+
+    def head(self, url: str) -> Optional[requests.Response]:
+        """快速檢查 URL 是否可達（不下載 body）。"""
+        self._rate_limit()
+        try:
+            return self.session.head(
+                url, timeout=10, allow_redirects=True
+            )
+        except Exception:
+            return None
