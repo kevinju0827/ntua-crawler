@@ -1,5 +1,5 @@
 """
-crawler/spider.py — 主要爬蟲協調器（多執行緒版）
+crawler/spider.py — 主要爬蟲協調器
 職責：
   - 初始化各元件（State、Fetcher、DomainChecker、Processor）
   - 以 ThreadPoolExecutor 並發爬取（預設 4 執行緒）
@@ -12,6 +12,7 @@ import logging
 import signal
 import threading
 import time
+import re
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Optional
 from urllib.parse import urlparse
@@ -115,7 +116,6 @@ class Spider:
         console.print(
             Panel(
                 f"[bold cyan]台藝大爬蟲啟動[/bold cyan]\n"
-                f"待處理 URL : [yellow]{pending}[/yellow]\n"
                 f"並發執行緒 : [magenta]{workers}[/magenta]\n"
                 f"輸出目錄   : [green]{config.OUTPUT_DIR.resolve()}[/green]\n"
                 f"最大深度   : {config.MAX_DEPTH}  /  最大頁面數 : {config.MAX_PAGES}\n"
@@ -177,26 +177,41 @@ class Spider:
         """
         progress = Progress(
             SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TaskProgressColumn(),
+            TextColumn("已執行: [green]{task.completed}/{task.total}[/green]"),  # 當前與最大頁面數
+            TextColumn("跳過: [yellow]{task.fields[skipped]}[/yellow]"),  # 已跳過
+            TextColumn("待辦: [magenta]{task.fields[pending]}[/magenta]"),  # 待執行
+            TextColumn("速度: [cyan]{task.fields[speed_str]}[/cyan]"),  # 執行速度
             TimeElapsedColumn(),
+            BarColumn(bar_width=3),
+            TextColumn("[bold cyan]{task.description}"),  # 當前正在派送的 URL
             console=console,
             transient=False,
         )
-        task_id = progress.add_task("爬取中…", total=config.MAX_PAGES)
+
+        # 取得初始狀態
+        initial_stats = self.state.get_stats()
+        initial_pending = self.state.get_pending_count()
+
+        # 註冊進度條任務，並定義我們自訂的欄位初始值
+        task_id = progress.add_task(
+            "準備中...",
+            total=config.MAX_PAGES,
+            skipped=initial_stats.get("skipped", 0),
+            pending=initial_pending,
+            speed_str="0.0 頁/秒"
+        )
 
         in_flight: set[Future] = set()
         max_in_flight = workers * 4
         last_checkpoint = 0
+        latest_url = ""  # 用來記錄當前派送的網址
 
         with progress, ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="crawler"
         ) as pool:
             while not self._stop_flag.is_set():
 
-                # ── 收割已完成的 futures ──────────────────────────────────
+                # ── 收割已完成的任務 ──
                 done_futures = {f for f in in_flight if f.done()}
                 for f in done_futures:
                     in_flight.discard(f)
@@ -206,9 +221,8 @@ class Spider:
                         logger.error(f"[工作執行緒例外] {e}", exc_info=True)
                     with self._processed_lock:
                         self._processed += 1
-                    progress.update(task_id, completed=self._processed)
 
-                # ── 檢查頁面上限 ──────────────────────────────────────────
+                # 檢查是否已達最大頁面數限制
                 with self._processed_lock:
                     current = self._processed
                 if current >= config.MAX_PAGES:
@@ -219,7 +233,7 @@ class Spider:
                     self._stop_flag.set()
                     break
 
-                # ── 補充新任務（填滿在途視窗）────────────────────────────
+                # ── 補充新任務 ──
                 slots = max_in_flight - len(in_flight)
                 dispatched = 0
                 while dispatched < slots and not self._stop_flag.is_set():
@@ -227,7 +241,8 @@ class Spider:
                     if item is None:
                         break
 
-                    url   = item["url"]
+                    url = item["url"]
+                    latest_url = url
                     depth = item["depth"]
 
                     # 超過深度限制：主執行緒直接跳過，不佔工作執行緒資源
@@ -238,13 +253,6 @@ class Spider:
                         with self._processed_lock:
                             self._processed += 1
                         continue
-
-                    progress.update(
-                        task_id,
-                        description=(
-                            f"[cyan]{url[:72]}…" if len(url) > 72 else f"[cyan]{url}"
-                        ),
-                    )
 
                     future = pool.submit(
                         self._process_url, url, depth, item.get("parent_url")
@@ -257,21 +265,38 @@ class Spider:
                     console.print("[green]✅ 所有 URL 已處理完畢[/green]")
                     break
 
-                # ── Checkpoint（每 50 筆） ────────────────────────────────
-                with self._processed_lock:
-                    current = self._processed
+                # ── 動態更新進度條資訊 ──
+                elapsed = time.monotonic() - self._start_time
+                speed = current / elapsed if elapsed > 0 else 0
+                stats = self.state.get_stats()
+
+                # 截斷當前網址，避免破壞終端機排版 (只顯示後 40 字元)
+                if latest_url:
+                    parsed_path = latest_url.split("://")[-1]
+                    short_url = f"...{parsed_path[-35:]}" if len(parsed_path) > 35 else parsed_path
+                else:
+                    short_url = "掃描中..."
+
+                progress.update(
+                    task_id,
+                    completed=current,
+                    skipped=stats.get("skipped", 0),
+                    pending=self.state.get_pending_count(),
+                    speed_str=f"{speed:.1f} 頁/秒",
+                    description=short_url
+                )
+
+                # Checkpoint：每 50 筆存檔並印出日誌
                 if current - last_checkpoint >= 50 and current > 0:
                     last_checkpoint = current
                     self._checkpoint(current)
 
-                # 主執行緒短暫讓出，避免 CPU 空轉
+                # 迴圈極短暫休息，避免佔用 100% CPU
                 time.sleep(0.05)
 
-            # ── 停止後收割剩餘在途任務 ───────────────────────────────────
+            # ── 結束前等待剩餘任務 ──
             if in_flight:
-                console.print(
-                    f"[dim]等待 {len(in_flight)} 個進行中任務完成…[/dim]"
-                )
+                console.print(f"[dim]等待 {len(in_flight)} 個進行中任務完成…[/dim]")
                 for f in as_completed(in_flight):
                     try:
                         f.result()

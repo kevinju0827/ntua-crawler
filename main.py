@@ -18,15 +18,22 @@ import sys
 # ── 設定 logging ──────────────────────────────────────────────────────────────
 def setup_logging(verbose: bool = False):
     import config
+    from rich.logging import RichHandler
 
     log_level = logging.DEBUG if verbose else logging.INFO
-    fmt       = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    datefmt   = "%H:%M:%S"
+    fmt = "%(name)s: %(message)s"
+    datefmt = "%H:%M:%S"
 
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     handlers = [
-        logging.StreamHandler(sys.stdout),
+        RichHandler(
+            level=logging.WARNING if not verbose else logging.DEBUG,
+            show_time=True,
+            show_level=True,
+            omit_repeated_times=False,
+            rich_tracebacks=True
+        ),
         logging.FileHandler(config.LOG_FILE, encoding="utf-8"),
     ]
     # 終端只顯示 WARNING 以上（進度由 rich 負責），檔案記錄全部
@@ -37,9 +44,8 @@ def setup_logging(verbose: bool = False):
         level=log_level, format=fmt, datefmt=datefmt, handlers=handlers
     )
 
-    # 壓制第三方套件雜訊
-    for noisy in ("urllib3", "requests", "charset_normalizer", "bs4"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+    for noisy in ("urllib3", "requests", "charset_normalizer", "bs4", "playwright"):
+        logging.getLogger(noisy).setLevel(logging.ERROR)
 
 
 def main():
@@ -161,7 +167,7 @@ def main():
         if args.page_size < 1:
             parser.error("--page-size 必須 >= 1")
         config.MAX_PAGE_SIZE_MB = args.page_size
-        config.MAX_DOC_SIZE_MB  = args.page_size
+        config.MAX_DOC_SIZE_MB = args.page_size
 
     if args.no_ssl_verify:
         config.SSL_VERIFY = False
@@ -195,9 +201,9 @@ def main():
     c = Console()
 
     if not args.fresh and config.STATE_DB.exists():
-        state   = StateManager(config.STATE_DB)
-        stats   = state.get_stats()
-        done    = stats.get("done", 0)
+        state = StateManager(config.STATE_DB)
+        stats = state.get_stats()
+        done = stats.get("done", 0)
         pending = state.get_pending_count()
 
         c.print(

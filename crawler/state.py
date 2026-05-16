@@ -53,7 +53,8 @@ CREATE INDEX IF NOT EXISTS idx_urls_type   ON urls(type);
 class StateManager:
     """
     執行緒安全的 SQLite 狀態管理器。
-    每個執行緒使用獨立的 Connection，透過 Write-Ahead Logging 提高並發效能。
+    每次 DB 操作使用獨立 Connection（避免跨執行緒共用），
+    WAL 模式允許多個 reader + 1 writer 並存，大幅提升並發效能。
     """
 
     def __init__(self, db_path: Path):
@@ -108,9 +109,10 @@ class StateManager:
         """
         with self._lock, self._connect() as conn:
             row = conn.execute(
-                """SELECT * FROM urls
+                """SELECT *
+                   FROM urls
                    WHERE status = 'pending'
-                   ORDER BY depth ASC, id ASC
+                   ORDER BY depth, id
                    LIMIT 1"""
             ).fetchone()
             if row is None:
@@ -202,7 +204,7 @@ class StateManager:
         """取出全部記錄，用於最終輸出 CSV。"""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM urls ORDER BY depth ASC, id ASC"
+                "SELECT * FROM urls ORDER BY depth , id "
             ).fetchall()
             return [dict(r) for r in rows]
 

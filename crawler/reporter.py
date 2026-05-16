@@ -13,27 +13,18 @@ from crawler.state import StateManager
 
 logger = logging.getLogger(__name__)
 
-# CSV 欄位定義
 CSV_FIELDS = [
     "id",
+    "processed_at", # 處理完成時間
+    "status",       # 只會保留 done / skipped
+    "type",         # webpage / pdf / docx 等
     "title",        # 頁面或文件標題
-    "type",         # webpage / pdf / docx / xlsx / ...
     "url",          # 完整連結
-    "parent_url",   # 來源頁面
-    "depth",        # 爬取深度
-    "status",       # done / error / skipped / external
-    "content_type", # MIME type
-    "file_size_kb", # 大小（KB，四捨五入）
-    "local_path",   # 本機儲存路徑（若有）
-    "error_msg",    # 錯誤訊息（若有）
-    "discovered_at",
-    "processed_at",
 ]
-
 
 def generate_csv(state: StateManager, output_path: Path) -> int:
     """
-    將 StateManager 中的所有記錄輸出為 CSV。
+    將 StateManager 中的已完成記錄輸出為 CSV。
     回傳總列數。
     """
     records = state.get_all_records()
@@ -44,15 +35,13 @@ def generate_csv(state: StateManager, output_path: Path) -> int:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
 
-        for rec in records:
-            row = dict(rec)
-            # 計算 KB
-            size = row.get("file_size") or 0
-            row["file_size_kb"] = round(size / 1024, 1) if size else ""
-            writer.writerow(row)
+        count = 0
+        for r in records:
+            if r.get("status") in ("done", "skipped"):
+                writer.writerow(r)
+                count += 1
 
-    logger.info(f"[CSV] 輸出完成：{output_path}（{len(records)} 筆）")
-    return len(records)
+    return count
 
 
 def print_summary(state: StateManager):
