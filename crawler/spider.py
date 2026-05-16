@@ -3,6 +3,7 @@ crawler/spider.py — 主要爬蟲協調器（多執行緒版）
 職責：
   - 初始化各元件（State、Fetcher、DomainChecker、Processor）
   - 以 ThreadPoolExecutor 並發爬取（預設 4 執行緒）
+  - 兩階段抓取：預設快速請求，偵測到 SPA 網頁自動切換為 Playwright 渲染
   - BFS 廣度優先：主執行緒持續從 DB 取出 pending URL 派送給工作執行緒
   - 支援 Ctrl+C 優雅停止（完成已派送的任務後停止）
   - 定期 checkpoint 輸出 CSV
@@ -46,6 +47,7 @@ class Spider:
       - 1 個主執行緒負責調度（從 DB 取 URL、判斷域名、派送任務）
       - N 個工作執行緒（config.WORKERS）負責 HTTP 抓取 + 內容處理
       - 每個工作執行緒有獨立的 requests.Session 與速率計時器
+      - 具備 _needs_js_rendering() 探測，自動啟動 Playwright 渲染前端框架
       - DomainChecker 帶鎖共享（域名探測為 I/O 密集，可並發）
       - StateManager 以 SQLite WAL 模式支援多執行緒並發寫入
 
@@ -133,6 +135,34 @@ class Spider:
             f"\n[bold green]📄 CSV 清單已儲存：[/bold green]{config.CSV_OUTPUT} "
             f"[dim]({count} 筆)[/dim]"
         )
+
+    # ── 輔助偵測方法 ─────────────────────────────────────────────────────────
+
+    def _needs_js_rendering(self, text: str) -> bool:
+        """
+        簡易啟發式檢查：判斷此 HTML 是否為典型的 CSR (客戶端渲染) 網頁。
+        若是，則值得花費效能開啟 Playwright 進行渲染。
+        """
+        if not text:
+            return False
+
+        # 常見的前端框架掛載點或特徵
+        spa_signatures = [
+            '<div id="app"></div>',
+            '<div id="__nuxt"></div>',
+            '<div id="__next"></div>',
+            'id="__NUXT_DATA__"',
+            '<noscript>You need to enable JavaScript',
+        ]
+
+        # 檢查是否包含特徵
+        has_spa_sig = any(sig in text for sig in spa_signatures)
+
+        # 如果 body 的內容異常的短 (< 1000 個字元)，通常也是只有 JS 的空殼
+        body_match = re.search(r'<body[^>]*>(.*?)</body>', text, re.IGNORECASE | re.DOTALL)
+        is_empty_body = body_match and len(body_match.group(1).strip()) < 1000
+
+        return has_spa_sig or (is_empty_body and "<script" in text)
 
     # ── 並發主迴圈 ────────────────────────────────────────────────────────────
 
@@ -289,7 +319,18 @@ class Spider:
             self.state.mark_error(url, result.error or f"HTTP {result.status_code}")
             return
 
-        # 5. 處理重定向後的最終 URL
+        # 5. SPA 動態渲染檢測（如果網頁內容特徵顯示為前端框架，則切換至 Playwright 渲染）
+        if result.url_type == "webpage" and result.text:
+            if self._needs_js_rendering(result.text):
+                logger.info(f"[SPA 偵測] 發現前端渲染特徵，啟動無頭瀏覽器重抓: {url}")
+                try:
+                    rendered_result = self.fetcher.fetch_rendered(url)
+                    if rendered_result.ok:
+                        result = rendered_result
+                except Exception as e:
+                    logger.warning(f"[渲染跳過] 無法使用瀏覽器渲染 ({e})，退回靜態內容: {url}")
+
+        # 6. 處理重定向後的最終 URL
         final_url = normalize_url(result.url)
         if final_url != url and not self.state.is_known_url(final_url):
             self.state.add_url(
@@ -297,7 +338,7 @@ class Spider:
                 url_type=result.url_type,
             )
 
-        # 6. 依類型分流
+        # 7. 依類型分流
         doc_type_set = {e.lstrip(".") for e in config.DOCUMENT_EXTENSIONS}
         if result.url_type == "webpage":
             self._handle_webpage(result, depth)

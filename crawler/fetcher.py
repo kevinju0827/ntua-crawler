@@ -24,6 +24,12 @@ from urllib3.util.retry import Retry
 
 import config
 
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # ── 文件副檔名 → 類型標籤對應表 ──────────────────────────────────────────────
@@ -281,3 +287,76 @@ class Fetcher:
             )
         except Exception:
             return None
+
+    def _get_playwright_browser(self):
+        """
+        取得當前執行緒專屬的 Playwright 瀏覽器實例（懶建立）。
+        避免每次請求都重開瀏覽器，節省大量效能。
+        """
+        if not PLAYWRIGHT_AVAILABLE:
+            raise RuntimeError("未安裝 Playwright，無法使用渲染抓取。")
+
+        key_pw = f"playwright_{id(self)}"
+        key_browser = f"browser_{id(self)}"
+
+        if not hasattr(_thread_local, key_pw):
+            # 啟動 Playwright 並儲存在執行緒本地變數
+            pw = sync_playwright().start()
+            setattr(_thread_local, key_pw, pw)
+            # 啟動 Chromium (無頭模式)，可以根據需求關閉圖片載入以加速
+            browser = pw.chromium.launch(headless=True)
+            setattr(_thread_local, key_browser, browser)
+
+        return getattr(_thread_local, key_browser)
+
+    def fetch_rendered(self, url: str) -> FetchResult:
+        """
+        使用真實瀏覽器 (Playwright) 開啟網頁，等待 JS 渲染完畢後再擷取 HTML。
+        專門用來對付 Vue, React, Nuxt 等 CSR 網站。
+        """
+        self._rate_limit()
+
+        try:
+            browser = self._get_playwright_browser()
+            # 建立新的瀏覽器上下文與分頁
+            context = browser.new_context(
+                ignore_https_errors=not config.SSL_VERIFY,
+                user_agent=config.HEADERS.get("User-Agent")
+            )
+            page = context.new_page()
+
+            logger.info(f"[渲染抓取] 正在渲染頁面: {url}")
+
+            # 導航至頁面，等待網路閒置 (networkidle 代表 JS 已經抓完大部分 API 資料)
+            response = page.goto(
+                url,
+                wait_until="networkidle",
+                timeout=config.REQUEST_TIMEOUT * 1000  # Playwright 使用毫秒
+            )
+
+            # 取得渲染後的完整 HTML
+            html_content = page.content()
+            status_code = response.status if response else 200
+
+            # 清理資源
+            page.close()
+            context.close()
+
+            return FetchResult(
+                url=page.url,
+                original_url=url,
+                status_code=status_code,
+                content_type="text/html; charset=utf-8",
+                content=html_content.encode("utf-8"),
+                text=html_content,
+                file_size=len(html_content),
+                url_type="webpage"
+            )
+
+        except Exception as e:
+            logger.error(f"[渲染抓取失敗] {url}: {e}")
+            return FetchResult(
+                url=url, original_url=url, status_code=0,
+                content_type="", content=None, text=None, file_size=0,
+                url_type="webpage", error=str(e),
+            )

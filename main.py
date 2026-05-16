@@ -47,7 +47,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         prog="ntua-crawler",
-        description="台灣藝術大學官方網站爬蟲 — 將頁面轉為 Markdown 並彙整清單 CSV",
+        description="台灣藝術大學官方網站爬蟲 — 將頁面轉為 Markdown 並彙整清單 CSV (具備 SPA/CSR 動態網頁自動渲染能力)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 範例：

@@ -1,20 +1,22 @@
 # 🕷️ 台藝大官網爬蟲 (NTUA Crawler)
 
 自動爬取**國立臺灣藝術大學**官方網站（含各系所單位），將頁面轉換為 Markdown 格式並彙整為 CSV 清單。
+具備智能域名判斷與 **SPA/CSR 前端框架 (Vue/React/Nuxt)** 的自動渲染解析能力。
 
 ---
 
 ## ✨ 功能特色
 
-| 功能 | 說明 |
-|------|------|
-| 🔄 可中斷繼續 | 以 SQLite 記錄狀態，Ctrl+C 後重新執行自動續爬 |
-| 🧠 智能域名判斷 | 自動偵測台藝大各系所獨立域名，不誤入外部網站 |
+| 功能             | 說明                                                 |
+|----------------|----------------------------------------------------|
+| 🔄 可中斷繼續       | 以 SQLite 記錄狀態，Ctrl+C 後重新執行自動續爬                     |
+| 🧠 智能域名判斷      | 自動偵測台藝大各系所獨立域名，不誤入外部網站                             |
+| 🎭 SPA/CSR 解析  | 自動偵測 Vue/Nuxt 網頁，啟動 Playwright 無頭瀏覽器進行真實渲染         |
 | 📄 Markdown 轉換 | 使用 Microsoft markitdown，支援 HTML/PDF/DOCX/XLSX/PPTX |
-| 📊 CSV 清單 | 含標題、類型、連結、來源、大小等完整欄位 |
-| 🌐 BFS 爬取 | 廣度優先，優先爬取淺層頁面 |
-| ⚡ 速率限制 | 內建禮貌延遲，避免對伺服器造成負擔 |
-| 📈 即時進度 | 終端進度條 + 完成後統計摘要 |
+| 📊 CSV 清單      | 含標題、類型、連結、來源、大小等完整欄位                               |
+| 🌐 BFS 爬取      | 廣度優先，優先爬取淺層頁面                                      |
+| ⚡ 速率限制         | 內建禮貌延遲，避免對伺服器造成負擔                                  |
+| 📈 即時進度        | 終端進度條 + 完成後統計摘要                                    |
 
 ---
 
@@ -30,9 +32,9 @@ ntua_crawler/
     ├── __init__.py
     ├── state.py         # SQLite 狀態管理（可中斷續爬）
     ├── domain.py        # 智能域名白名單檢查器
-    ├── fetcher.py       # HTTP 抓取器（重試、速率限制）
-    ├── processor.py     # 內容處理（標題提取、Markdown 轉換）
-    ├── spider.py        # 主爬蟲協調器
+    ├── fetcher.py       # HTTP 抓取器（含 Playwright 渲染、重試、速率限制）
+    ├── processor.py     # 內容處理（現代網頁標題與連結提取、Markdown 轉換）
+    ├── spider.py        # 主爬蟲協調器（兩階段抓取策略）
     └── reporter.py      # CSV 與摘要報表產生器
 ```
 
@@ -44,6 +46,9 @@ ntua_crawler/
 
 ```bash
 pip install -r requirements.txt
+
+# 安裝 Playwright 瀏覽器核心 (以支援 Vue/Nuxt 動態網頁渲染)
+playwright install chromium
 ```
 
 > **建議使用虛擬環境：**
@@ -51,6 +56,7 @@ pip install -r requirements.txt
 > python -m venv .venv
 > source .venv/bin/activate   # Windows: .venv\Scripts\activate
 > pip install -r requirements.txt
+> playwright install chromium
 > ```
 
 ### 2. 執行爬蟲
@@ -119,21 +125,21 @@ MANUAL_ALLOWED_DOMAINS = [
 
 ## 📊 CSV 欄位說明
 
-| 欄位 | 說明 |
-|------|------|
-| `id` | 流水號 |
-| `title` | 頁面或文件標題（智能提取） |
-| `type` | 類型（webpage / pdf / docx / xlsx / ...） |
-| `url` | 完整連結 |
-| `parent_url` | 此連結的來源頁面 |
-| `depth` | 爬取深度（0 = 種子頁） |
-| `status` | 狀態（done / error / skipped） |
-| `content_type` | MIME 類型 |
-| `file_size_kb` | 檔案大小（KB） |
-| `local_path` | 本機儲存路徑（若有轉換） |
-| `error_msg` | 錯誤訊息（若有） |
-| `discovered_at` | 發現時間 |
-| `processed_at` | 處理完成時間 |
+| 欄位              | 說明                                    |
+|-----------------|---------------------------------------|
+| `id`            | 流水號                                   |
+| `title`         | 頁面或文件標題（智能提取）                         |
+| `type`          | 類型（webpage / pdf / docx / xlsx / ...） |
+| `url`           | 完整連結                                  |
+| `parent_url`    | 此連結的來源頁面                              |
+| `depth`         | 爬取深度（0 = 種子頁）                         |
+| `status`        | 狀態（done / error / skipped）            |
+| `content_type`  | MIME 類型                               |
+| `file_size_kb`  | 檔案大小（KB）                              |
+| `local_path`    | 本機儲存路徑（若有轉換）                          |
+| `error_msg`     | 錯誤訊息（若有）                              |
+| `discovered_at` | 發現時間                                  |
+| `processed_at`  | 處理完成時間                                |
 
 ---
 
@@ -181,11 +187,12 @@ python main.py
 
 ## 📦 相依套件
 
-| 套件 | 用途 |
-|------|------|
-| `requests` | HTTP 請求 |
-| `beautifulsoup4` + `lxml` | HTML 解析 |
-| `markitdown[all]` | HTML/PDF/DOCX 等轉 Markdown |
-| `rich` | 終端進度條與格式化輸出 |
-| `chardet` | 自動偵測網頁編碼（Big5/UTF-8）|
-| `python-slugify` | 安全檔名產生（備用）|
+| 套件                        | 用途                        |
+|---------------------------|---------------------------|
+| `requests`                | HTTP 請求                   |
+| `playwright`              | SPA/CSR 動態網頁真實渲染 (JS)     |
+| `beautifulsoup4` + `lxml` | HTML 解析                   |
+| `markitdown[all]`         | HTML/PDF/DOCX 等轉 Markdown |
+| `rich`                    | 終端進度條與格式化輸出               |
+| `chardet`                 | 自動偵測網頁編碼（Big5/UTF-8）      |
+| `python-slugify`          | 安全檔名產生（備用）                |
