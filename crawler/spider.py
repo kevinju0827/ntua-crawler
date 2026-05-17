@@ -271,7 +271,7 @@ class Spider:
                 # 截斷當前網址，避免破壞終端機排版 (只顯示後 40 字元)
                 if latest_url:
                     parsed_path = latest_url.split("://")[-1]
-                    short_url = f"...{parsed_path[-35:]}" if len(parsed_path) > 35 else parsed_path
+                    short_url = f"{parsed_path[:20]}...{parsed_path[-15:]}" if len(parsed_path) > 35 else parsed_path
                 else:
                     short_url = "掃描中..."
 
